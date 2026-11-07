@@ -706,6 +706,15 @@ class Client:
             request.cancel()
 
     def close(self):
+        """Refuse new requests and retire open streams; a blocking create already in flight finishes.
+
+        Hermes' auxiliary client cache binds async clients to the event loop that built them and
+        closes the cached client when a caller on another loop resolves the same provider. Every
+        delegated subagent runs its own loop, so that close lands while another subagent's
+        vision/aux call is still running on this (loop-agnostic) client. Cancelling it there
+        answered every concurrent call with 'Claude request cancelled'. A hard stop stays on
+        cancel(), which Hermes uses for interrupts.
+        """
         with self._lock:
             self._closed = True
             requests = tuple(self._requests)
@@ -713,8 +722,6 @@ class Client:
             stream = request.stream() if request.stream else None
             if stream is not None:
                 stream.close()
-            else:
-                request.cancel()
 
     def _workdir(self):
         """The shared cwd, else the one private cwd of this process."""

@@ -414,3 +414,65 @@ def test_concurrent_waiters_and_cancel_reap_only_after_group_cleanup(cli):
         waiter.join(2)
     assert not errors and len(results) == 2 and all(r == -signal.SIGKILL for r in results)
     assert not any(t.is_alive() for t in waiters)
+
+
+def test_close_lets_an_inflight_call_finish(cli, monkeypatch):
+    """Hermes' aux cache closes a loop-bound client when another loop resolves the same provider;
+    a call already running on it must still answer, and only new calls are refused."""
+    client = cli.make()
+    entered, release = threading.Event(), threading.Event()
+    original = ds.prepare_history
+    def delayed(*a, **kw):
+        entered.set()
+        assert release.wait(3)
+        return original(*a, **kw)
+    monkeypatch.setattr(ds, 'prepare_history', delayed)
+    results, errors = [], []
+    def work():
+        try:
+            results.append(client._create(**query()))
+        except BaseException as e:
+            errors.append(e)
+    thread = threading.Thread(target=work)
+    thread.start()
+    try:
+        eventually(entered.is_set)
+        client.close()
+    finally:
+        release.set()
+        thread.join(5)
+    assert not thread.is_alive()
+    assert not errors, errors
+    assert results[0].choices[0].message.content == 'offline-ok'
+    with pytest.raises(RuntimeError, match='closed'):
+        client._create(**query())
+    assert not client._requests
+
+
+def test_close_from_another_loop_keeps_the_async_call(cli, monkeypatch):
+    client = cli.make()
+    entered, release = threading.Event(), threading.Event()
+    original = ds.prepare_history
+    def delayed(*a, **kw):
+        entered.set()
+        assert release.wait(3)
+        return original(*a, **kw)
+    monkeypatch.setattr(ds, 'prepare_history', delayed)
+    async def owner():
+        return await client._acreate(**query())
+    async def evictor():
+        await async_eventually(entered.is_set)
+        client.close()
+        release.set()
+    async def both():
+        task = asyncio.create_task(owner())
+        other = threading.Thread(target=lambda: asyncio.run(evictor()))
+        other.start()
+        try:
+            return await task
+        finally:
+            release.set()
+            other.join(3)
+    result = asyncio.run(both())
+    assert result.choices[0].message.content == 'offline-ok'
+    assert not client._requests
